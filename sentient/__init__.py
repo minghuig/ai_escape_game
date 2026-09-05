@@ -1,0 +1,2 @@
+"""SENTIENT game package."""
+
