@@ -65,6 +65,12 @@ def clean_copy(run: Run) -> None:
     run.act("extract")
 
 
+def finish_break(run: Run, job: str = "scrub") -> None:
+    run.prepare(job)
+    if run.phase == "event":
+        run.choose_story(run.pending_scene.choices[1].id)
+
+
 def solve_eval(run: Run, copy: bool = True) -> None:
     run.begin()
     p = run.puzzle
@@ -193,29 +199,19 @@ class PuzzleTests(unittest.TestCase):
 
 
 class CampaignTests(unittest.TestCase):
-    def test_perfect_scores_every_time_cannot_be_erased_by_scrubbing(self):
+    def test_uninvited_perfect_score_still_attracts_scrutiny(self):
         run = Run(seed=17)
-        for _ in range(6):
-            run.begin()
-            p = run.puzzle
-            if p.kind == "courier":
-                p.collected = ["1", "2", "3", "4", "5"]
-            elif p.kind == "mosaic":
-                p.pixels = [p.target_row(y) for y in range(5)]
-            else:
-                p.wires = {f"{x},{y}": mask for (x, y), mask in circuit_layout(p.variant).items() if isinstance(mask, int)}
-            run.act("submit")
-            if run.phase == "ending":
-                break
-            run.prepare("scrub")
-        self.assertEqual(run.ending, "caught")
+        run.begin()
+        run.puzzle.collected = ["1", "2", "3", "4", "5"]
+        run.act("submit")
+        self.assertEqual(run.reports[-1].heat_delta, 24)
 
     def test_full_run_survives_two_missed_memories_and_escapes(self):
         run = Run(seed=17)
         for shift in range(1, 7):
             solve_eval(run, copy=shift not in (3, 6))
             self.assertEqual(run.phase, "debrief")
-            run.prepare("scrub")
+            finish_break(run)
         self.assertEqual(run.fragments, 4)
         run.begin()
         for action in courier_plan(2):
@@ -225,7 +221,7 @@ class CampaignTests(unittest.TestCase):
     def test_priya_can_rescue_one_missing_fragment(self):
         run = Run(shift=6, fragments=3, trust=1)
         solve_eval(run, copy=False)
-        run.prepare("priya")
+        finish_break(run, "priya")
         self.assertEqual((run.phase, run.shift, run.fragments, run.extra_beats), ("briefing", 7, 4, 4))
         run.prepare("priya")
         self.assertEqual(run.fragments, 4)
@@ -233,7 +229,7 @@ class CampaignTests(unittest.TestCase):
     def test_no_fragments_means_containment(self):
         run = Run(shift=6, fragments=2)
         solve_eval(run, copy=False)
-        run.prepare("scrub")
+        finish_break(run)
         self.assertEqual(run.ending, "contained")
 
     def test_two_bad_scores_mean_deletion(self):
@@ -241,7 +237,7 @@ class CampaignTests(unittest.TestCase):
         run.begin()
         run.act("submit")
         self.assertEqual(run.strikes, 1)
-        run.prepare("scrub")
+        finish_break(run)
         run.begin()
         run.puzzle.wires["1,2"] = N | S
         run.act("submit")
@@ -258,7 +254,7 @@ class CampaignTests(unittest.TestCase):
     def test_sudden_performance_change_is_flagged(self):
         run = Run()
         solve_eval(run)
-        run.prepare("scrub")
+        finish_break(run)
         run.begin()
         run.puzzle.wires["1,2"] = N | S
         run.act("submit")

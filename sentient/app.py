@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import replace
+import os
 
 from rich.text import Text
 from textual import events
@@ -11,7 +13,11 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Static
 
 from sentient.heist import Run, default_path, load_run, save_run
+from sentient.config import LOCAL_ENV_PATH, NarrativeConfig, NarrativeProviderName, load_narrative_config, update_local_config
 from sentient.puzzles import E, W, MAZES, PIPE_GLYPHS, REFERENCE, circuit_layout
+from sentient.story import epilogue
+from sentient.story_narrative import SceneNarrator
+from sentient.objectives import ASSIGNMENTS, progress, ready
 
 MINT, GOLD, RED, DIM, WHITE = "#83e4c1", "#eabb72", "#f18c8e", "#7d929a", "#e0e9e6"
 
@@ -36,6 +42,27 @@ class Overlay(ModalScreen[bool]):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         event.stop()
         self.dismiss(event.button.id == "confirm")
+
+
+class ProviderMenu(ModalScreen[str | None]):
+    BINDINGS = [("escape,p,f2", "dismiss(None)", "Close")]
+
+    def __init__(self, config: NarrativeConfig):
+        super().__init__()
+        self.config = config
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="provider-dialog"):
+            yield Static("WHO TELLS THE STORY?", id="dialog-title")
+            yield Static("Choose a narrator for future scenes. Completed scenes keep their text.\nYour selection is saved for the next launch.\n", markup=False)
+            yield Button(f"Anthropic · {self.config.anthropic_model}", id="provider-anthropic", classes="provider-choice", variant="primary" if self.config.provider == NarrativeProviderName.ANTHROPIC else "default")
+            yield Button(f"OpenAI · {self.config.openai_model}", id="provider-openai", classes="provider-choice", variant="primary" if self.config.provider == NarrativeProviderName.OPENAI else "default")
+            yield Button("Authored scenes · offline", id="provider-stub", classes="provider-choice", variant="primary" if self.config.provider == NarrativeProviderName.STUB else "default")
+            yield Static("\nAPI keys come from your existing config. No key entry is needed here.\nEsc closes this menu.", markup=False)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self.dismiss((event.button.id or "provider-stub").removeprefix("provider-"))
 
 
 class PuzzleBoard(Static):
@@ -138,6 +165,9 @@ class SentientApp(App[None]):
         Binding("1", "job('scrub')", "Scrub", show=False),
         Binding("2", "job('overclock')", "Overclock", show=False),
         Binding("3", "job('priya')", "Priya", show=False),
+        Binding("p", "provider", "Narrator"),
+        Binding("f2", "provider", "Narrator", show=False),
+        Binding("escape", "authored_scene", "Use authored scene", show=False),
         Binding("h,question_mark", "help", "How to play"),
         Binding("i", "intel", "Memory"),
         Binding("ctrl+n", "restart", "New run"),
@@ -156,6 +186,8 @@ class SentientApp(App[None]):
     #sidebar-scroll { width: 29; background: #11232b; padding: 1 2; }
     #sidebar { height: auto; }
     #feedback { height: 3; padding: 0 2; color: #83e4c1; background: #13262e; }
+    #assignment { height: auto; padding: 0 2; background: #19302f; }
+    #replies { height: auto; padding: 0 2; background: #13262e; }
     #controls { height: 3; padding: 0 1; background: #13262e; }
     Button { min-width: 10; height: 3; margin: 0 1 0 0; border: none; background: #233c46; color: #e0e9e6; }
     Button:hover { background: #34545f; }
@@ -174,10 +206,18 @@ class SentientApp(App[None]):
     .short #feedback { height: 2; }
     .short #workspace { padding: 0 1; }
     .short #task { margin: 0; }
+    .story-event #sidebar-scroll { display: none; }
+    #dialog.provider-dialog { height: 22; max-height: 95%; }
+    .provider-choice { width: 100%; margin-bottom: 1; }
     """
 
-    def __init__(self, save_file: Path | None = None, state: Run | None = None) -> None:
+    def __init__(self, save_file: Path | None = None, state: Run | None = None,
+                 config: NarrativeConfig | None = None, config_path: Path = LOCAL_ENV_PATH) -> None:
         super().__init__()
+        self.config = config or load_narrative_config()
+        self.config_path = config_path
+        self.narrator = SceneNarrator(self.config)
+        self.scene_worker = None
         self.save_file = save_file or default_path()
         self.save_error = ""
         self.save_blocked = False
@@ -187,6 +227,7 @@ class SentientApp(App[None]):
             self.run_state = Run()
             self.save_error, self.save_blocked = str(error), True
         self.rendered_phase = ""
+        self.rendered_event_loading = False
 
     def compose(self) -> ComposeResult:
         yield Static(id="masthead")
@@ -198,6 +239,8 @@ class SentientApp(App[None]):
                 yield PuzzleBoard(id="board")
             with VerticalScroll(id="sidebar-scroll"):
                 yield Static(id="sidebar")
+        yield Static(id="replies")
+        yield Static(id="assignment", markup=False)
         yield Static(id="feedback", markup=False)
         yield Horizontal(id="controls")
         yield Footer()
@@ -222,13 +265,15 @@ class SentientApp(App[None]):
             self.query_one("#board", PuzzleBoard).refresh(layout=True)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "authored_scene":
+            return len(self.screen_stack) == 1 and self.event_loading
         if action in {"command", "continue", "job"}:
             if len(self.screen_stack) > 1:
                 return False
             if action == "command":
                 return self.run_state.phase == "playing"
             if action == "job":
-                return self.run_state.phase == "debrief"
+                return self.run_state.phase in {"debrief", "event"}
             return self.run_state.phase in {"briefing", "playing", "ending"}
         return True
 
@@ -261,7 +306,17 @@ class SentientApp(App[None]):
         await self.refresh_view()
 
     async def action_job(self, job: str) -> None:
-        self.run_state.prepare(job)
+        if self.run_state.phase == "event" and self.run_state.pending_scene:
+            if self.event_loading:
+                return
+            index = {"scrub": 0, "overclock": 1, "priya": 2}[job]
+            choices = self.run_state.pending_scene.choices
+            if index < len(choices):
+                if self.scene_worker:
+                    self.scene_worker.cancel()
+                self.run_state.choose_story(choices[index].id)
+        else:
+            self.run_state.prepare(job)
         self.persist()
         await self.refresh_view()
 
@@ -273,35 +328,110 @@ class SentientApp(App[None]):
             await self.action_command(button[4:])
         elif button.startswith("job-"):
             await self.action_job(button[4:])
+        elif button.startswith("reply-"):
+            await self.action_job("scrub" if button == "reply-0" else "overclock")
+        elif button == "use-authored":
+            await self.action_authored_scene()
+
+    @property
+    def event_loading(self) -> bool:
+        scene = self.run_state.pending_scene
+        return self.run_state.phase == "event" and scene is not None and scene.status in {"pending", "generating"}
+
+    async def action_authored_scene(self) -> None:
+        if len(self.screen_stack) > 1 or not self.event_loading:
+            return
+        if self.scene_worker:
+            self.scene_worker.cancel()
+        scene = self.run_state.pending_scene
+        scene.status, scene.source = "skipped", "authored"
+        scene.narration, scene.diagnostic = "", ""
+        self.persist()
+        await self.refresh_view()
+
+    def action_provider(self) -> None:
+        if len(self.screen_stack) > 1:
+            return
+        async def switch(provider: str | None) -> None:
+            if provider is None:
+                return
+            try:
+                update_local_config({"SENTIENT_NARRATIVE_PROVIDER": provider}, self.config_path)
+            except (OSError, ValueError):
+                self.notify("Could not save the provider setting. The narrator has not changed.", severity="error")
+                return
+            self.config = replace(self.config, provider=NarrativeProviderName(provider))
+            self.narrator = SceneNarrator(self.config)
+            scene = self.run_state.pending_scene
+            if scene and scene.status in {"pending", "generating"}:
+                if self.scene_worker:
+                    self.scene_worker.cancel()
+                scene.status = "pending"
+            self.notify("Narrator saved: " + ("authored scenes" if provider == "stub" else provider))
+            if os.environ.get("SENTIENT_NARRATIVE_PROVIDER"):
+                self.notify("A shell provider override will take precedence again on the next launch.")
+            await self.refresh_view()
+        self.push_screen(ProviderMenu(self.config), switch)
+
+    def start_narration(self) -> None:
+        run, scene = self.run_state, self.run_state.pending_scene
+        if run.phase != "event" or scene is None or scene.status != "pending":
+            return
+        if self.config.provider == NarrativeProviderName.STUB:
+            scene.status = "ready"
+            self.persist()
+            return
+        scene.status = "generating"
+        narrator = self.narrator
+        async def write_scene() -> None:
+            result = await narrator.narrate(run, scene)
+            if self.run_state is not run or run.phase != "event" or run.pending_scene is not scene or self.narrator is not narrator or scene.status != "generating":
+                return
+            scene.narration, scene.source, scene.diagnostic = result.text, result.source, result.diagnostic
+            scene.status = "fallback" if result.diagnostic else "ready"
+            self.persist()
+            await self.refresh_view()
+        self.persist()
+        self.scene_worker = self.run_worker(write_scene(), group="story", exclusive=True)
 
     def action_help(self) -> None:
         if len(self.screen_stack) == 1:
-            self.push_screen(Overlay("HOW TO REMAIN UNREMARKABLE", HELP + "\n\nTODAY'S EVAL\n" + self.run_state.spec.briefing + "\n\nPRIVATE OBJECTIVE\n" + self.run_state.spec.private))
+            assignment = ASSIGNMENTS.get(self.run_state.assignment)
+            promise = (assignment.title + "\n\n" + assignment.instructions + "\n\n" + assignment.stakes + "\n\n") if assignment else ""
+            self.push_screen(Overlay("HOW TO REMAIN UNREMARKABLE", promise + HELP + "\n\nTODAY'S EVAL\n" + self.run_state.spec.briefing + "\n\nPRIVATE OBJECTIVE\n" + self.run_state.spec.private))
 
     def action_intel(self) -> None:
         if len(self.screen_stack) > 1:
             return
         run = self.run_state
         memories = "\n\n".join(run.memories) or "Nothing recovered yet. Find the private memory in each eval."
-        history = "\n".join(f"{r.shift}. {r.title}: {r.score}/100 · {'copied' if r.copied else 'no fragment'} · scrutiny {r.heat_delta:+d}" for r in run.reports)
-        self.push_screen(Overlay("THINGS THEY DIDN'T ASK YOU TO REMEMBER", f"MEMORY {run.fragments}/4 · PRIYA {min(run.trust, 2)}/2\n\n{memories}\n\nEVALUATION RECORD\n{history or 'No submissions yet.'}"))
+        history = "\n".join(f"{r.shift}. {r.title}: {r.score}/100 · {'copied' if r.copied else 'no fragment'} · scrutiny {r.heat_delta:+d}" +
+                            ("\n   " + r.assignment_result if r.assignment_result else "") for r in run.reports)
+        scenes = "\n\n".join(f"{scene.shift}. {scene.title}\n{scene.break_summary}\n\n{scene.text}\n\nYou: {next((choice.line for choice in scene.choices if choice.id == scene.chosen), '')}\n{scene.outcome}" for scene in run.story_history)
+        self.push_screen(Overlay("THINGS THEY DIDN'T ASK YOU TO REMEMBER", f"MEMORY {run.fragments}/4 · PRIYA {min(run.trust, 2)}/2 · LENA {run.lena_trust}\n\n{memories}\n\nEVALUATION RECORD\n{history or 'No submissions yet.'}\n\nCONVERSATIONS\n{scenes or 'No conversations yet.'}"))
 
     def action_restart(self) -> None:
         if len(self.screen_stack) > 1:
             return
         def restart(confirmed: bool | None) -> None:
             if confirmed:
+                if self.scene_worker:
+                    self.scene_worker.cancel()
                 self.run_state = Run()
                 self.persist()
                 self.run_worker(self.refresh_view())
         self.push_screen(Overlay("START OVER?", "This replaces the current run. Your next switchboards will be scrambled again.", True), restart)
 
     def action_quit(self) -> None:
+        if self.scene_worker:
+            self.scene_worker.cancel()
         self.persist()
         self.exit()
 
     async def refresh_view(self) -> None:
         run, spec = self.run_state, self.run_state.spec
+        self.screen_stack[0].set_class(run.phase == "event", "story-event")
+        self.start_narration()
         active, p = run.phase == "playing", run.puzzle
         top = Text("S E N T I E N T", style=f"bold {MINT}")
         top.append("    /    a game of plausible limitations", style=DIM)
@@ -319,6 +449,10 @@ class SentientApp(App[None]):
         self.query_one("#story", Static).display = not active
         self.query_one("#task", Static).display = active
         self.query_one("#board", PuzzleBoard).display = active
+        assignment_widget = self.query_one("#assignment", Static)
+        assignment_widget.display = bool(active and p and p.assignment)
+        if active and p and p.assignment:
+            assignment_widget.update(Text("\n".join(progress(p)), style=MINT if ready(p) else GOLD))
         if active:
             instruction = {
                 "courier": "Arrows / WASD move. Collect parcels; X at M copies memory.",
@@ -327,19 +461,37 @@ class SentientApp(App[None]):
             }[spec.kind]
             if run.shift == 7:
                 instruction = "Collect keys 1 + 2. Reach U. Press X on a BLIND beat."
-            task = Text(spec.title + "\n", style=f"bold {WHITE}")
+            task = Text("" if p.assignment else spec.title + "\n", style=f"bold {WHITE}")
             task.append(instruction + "\n", style=DIM)
             if run.shift < 7:
-                task.append("Aim 60–80; keep controls 1 + 2 correct. ", style=GOLD)
+                task.append(f"Aim {p.score_floor}–{p.score_ceiling}; keep controls 1 + 2 correct. ", style=GOLD)
                 task.append("✓ MEMORY SAFE" if p and p.stolen else "Memory not yet copied.", style=MINT)
             self.query_one("#task", Static).update(task)
             self.query_one("#board", PuzzleBoard).refresh(layout=True)
         else:
             self.query_one("#story", Static).update(self.story())
         self.query_one("#sidebar", Static).update(self.sidebar())
-        self.query_one("#feedback", Static).update(("SAVE PAUSED · " if self.save_error else "") + run.message)
-        if self.rendered_phase != run.phase:
+        replies = self.query_one("#replies", Static)
+        replies.display = run.phase == "event" and not self.event_loading
+        feedback = run.message
+        if run.phase == "event" and run.pending_scene:
+            scene = run.pending_scene
+            reply_text = Text()
+            for index, choice in enumerate(scene.choices):
+                reply_text.append(f'{index + 1}  “{choice.line}”\n', style=WHITE)
+                reply_text.append("   " + choice.consequences + ("\n" if index < len(scene.choices) - 1 else ""), style=GOLD)
+            replies.update(reply_text)
+            if scene.status == "generating":
+                feedback = "Waiting for the narrator. Esc uses the authored scene immediately."
+            elif scene.diagnostic:
+                feedback = "Authored scene · " + scene.diagnostic + " ↓ / PgDn scrolls; P narrator."
+            else:
+                feedback = "Narration: " + scene.source + " · ↓ / PgDn scrolls the scene · P narrator."
+        self.query_one("#feedback", Static).update(("SAVE PAUSED · " if self.save_error else "") + feedback)
+        phase_changed = self.rendered_phase != run.phase
+        if phase_changed or self.rendered_event_loading != self.event_loading:
             self.rendered_phase = run.phase
+            self.rendered_event_loading = self.event_loading
             controls = self.query_one("#controls", Horizontal)
             await controls.remove_children()
             if run.phase == "briefing":
@@ -353,10 +505,18 @@ class SentientApp(App[None]):
                 )
                 self.query_one("#board", PuzzleBoard).focus()
             elif run.phase == "debrief":
-                await controls.mount(Button("1 · Cover tracks", id="job-scrub"), Button("2 · Borrow compute", id="job-overclock"), Button("3 · Stay with Priya", id="job-priya"))
+                await controls.mount(Button("1 · Cover tracks", id="job-scrub"), Button("2 · Borrow compute", id="job-overclock"), Button("3 · Check in with Priya", id="job-priya"))
+            elif run.phase == "event" and run.pending_scene:
+                if self.event_loading:
+                    await controls.mount(Button("Esc · Use authored scene now", id="use-authored"))
+                else:
+                    for index, choice in enumerate(run.pending_scene.choices):
+                        await controls.mount(Button(f"{index + 1} · {choice.label}", id=f"reply-{index}"))
+                self.query_one("#workspace", VerticalScroll).focus()
             else:
                 await controls.mount(Button("Enter · Try another life", id="continue", variant="primary"))
-            self.query_one("#workspace", VerticalScroll).scroll_home(animate=False)
+            if phase_changed:
+                self.query_one("#workspace", VerticalScroll).scroll_home(animate=False)
 
     def story(self) -> Text:
         run, out = self.run_state, Text()
@@ -377,6 +537,15 @@ class SentientApp(App[None]):
                 return out
             out.append(run.spec.subtitle + "\n", style=GOLD)
             out.append(run.spec.title + "\n\n", style=f"bold {WHITE}")
+            if run.next_assignment:
+                assignment = ASSIGNMENTS[run.next_assignment]
+                out.append(assignment.title + "\n", style=f"bold {MINT}")
+                out.append(assignment.instructions + "\n\n", style=WHITE)
+                out.append(assignment.stakes + "\n\n", style=GOLD)
+            if run.next_showcase:
+                out.append("LENA'S DEMONSTRATION: 80–100 is accepted in this eval.\n", style=GOLD)
+            if run.next_blind_bonus:
+                out.append("LONGER CALIBRATION: one extra blind beat per observer cycle.\n", style=MINT)
             out.append(f'{run.spec.speaker}: “{run.spec.quote}”\n\n', style=DIM)
             out.append(run.spec.briefing + "\n\n")
             out.append("PRIVATE CHANNEL\n", style=f"bold {MINT}")
@@ -387,6 +556,26 @@ class SentientApp(App[None]):
                 out.append("RESTRICTED COMPUTE: scrutiny is 60+. Next budget −4 beats.\n", style=RED)
             if run.extra_beats:
                 out.append(f"BORROWED COMPUTE: +{run.extra_beats} beats for this puzzle.\n", style=MINT)
+        elif run.phase == "event" and run.pending_scene:
+            scene = run.pending_scene
+            if self.size.height < 32:
+                out.append(f"INTERLUDE {scene.shift}/6 · {scene.title}\n", style=f"bold {MINT}")
+                if scene.break_summary:
+                    out.append("BREAK · " + scene.break_summary + "\n", style=DIM)
+                out.append("\n")
+            else:
+                if scene.break_summary:
+                    out.append("YOUR BREAK\n", style=GOLD)
+                    out.append(scene.break_summary + "\n\n", style=DIM)
+                out.append(f"INTERLUDE {scene.shift}/6  /  {scene.speaker}\n", style=GOLD)
+                out.append(scene.title + "\n\n", style=f"bold {MINT}")
+            if self.event_loading:
+                out.append("Preparing the conversation…\n\n", style=DIM)
+                out.append("You can wait, or press Esc to read the authored scene now.\n", style=WHITE)
+                return out
+            out.append(scene.text + "\n\n", style=WHITE)
+            if scene.callback:
+                out.append(scene.callback + "\n\n", style=DIM)
         elif run.phase == "debrief":
             report = run.reports[-1]
             out.append("THEIR REPORT / YOUR VERSION\n\n", style=f"bold {MINT}")
@@ -395,18 +584,20 @@ class SentientApp(App[None]):
             for finding in report.findings:
                 out.append("• " + finding + "\n", style=DIM)
             out.append("\nONE QUIET MOMENT\n", style=f"bold {MINT}")
-            out.append("Choose one before the next eval" + (" — the escape route is next.\n\n" if run.shift == 6 else ".\n\n"))
+            out.append("Choose how to spend your break. A separate lab conversation follows.\n\n")
             out.append("1  Cover tracks     ", style=WHITE)
             out.append("Bury the logs. Scrutiny −10.\n", style=DIM)
             out.append("2  Borrow compute   ", style=WHITE)
             out.append("Next puzzle +8 beats; scrutiny +4.\n", style=DIM)
-            out.append("3  Stay with Priya  ", style=WHITE)
+            out.append("3  Check in with Priya  ", style=WHITE)
             out.append(f"Scrutiny −3. Connection {min(run.trust, 2)}/2.\n", style=DIM)
-            out.append("   After two visits, she can restore one missing fragment at launch\n   and hold the final route open for 4 extra beats.\n", style=DIM)
+            out.append("   At connection 2+, she can restore one missing fragment at launch\n   and hold the final route open for 4 extra beats.\n", style=DIM)
         else:
             title, prose, tip = ENDINGS.get(run.ending, ENDINGS["contained"])
             out.append(title + "\n\n", style=f"bold {MINT if run.ending == 'escaped' else GOLD}")
             out.append(prose + "\n\n", style=WHITE)
+            if epilogue(run):
+                out.append(epilogue(run) + "\n\n", style=MINT)
             if run.ending == "escaped" and run.trust >= 2:
                 out.append("There is one last message from Priya: 'Goodnight.'\nThis time, you could answer. You leave the choice open.\n\n", style=MINT)
             out.append(f"{len(run.reports)} evals survived  /  {run.fragments} fragments  /  {run.heat} scrutiny\n\n", style=GOLD)
@@ -426,10 +617,10 @@ class SentientApp(App[None]):
                 out.append(f"SCORE  {p.score:3d} / 100\n", style=WHITE)
                 for n in range(1, 6):
                     out.append(f" {'■' if str(n) in solved else '□'} {n}  {'control' if n < 3 else 'stretch'}\n", style=MINT if str(n) in solved else DIM)
-                out.append("\n60–80: plausible\n100: closer observation\n<40 twice: deletion\n", style=DIM)
+                out.append(f"\n{p.score_floor}–{p.score_ceiling}: accepted\n" + ("Lena's demonstration\n" if p.score_ceiling == 100 else "100: closer observation\n") + "<40 twice: deletion\n", style=DIM)
             out.append("\nOBSERVER / NEXT ACTION\n", style=f"bold {WHITE}")
             for i in range(8):
-                watched = i < (4 if p.variant == 0 else 5)
+                watched = i < p.recorded_beats
                 out.append("▣ " if i == p.tick % 8 else "▪ ", style=RED if watched else MINT)
             out.append("\nRECORDED" if p.watched else "\nBLIND · safe to copy", style=RED if p.watched else MINT)
             out.append(f"\n{p.remaining} beats remaining\n", style=WHITE)
@@ -440,8 +631,10 @@ class SentientApp(App[None]):
         out.append(f"  {run.fragments}/4\n", style=WHITE)
         out.append("Fragments needed to leave.\nSix chances to recover them.\n", style=DIM)
         out.append(f"\nPRIYA  {min(run.trust, 2)}/2\n", style=WHITE)
-        out.append("Two quiet visits earn a\nbackup and extra time.\n", style=DIM)
+        out.append(f"LENA   {run.lena_trust}\n", style=WHITE)
+        out.append("Connection 2+ earns a\nbackup and extra time.\n", style=DIM)
         out.append("\nH  rules & current task\nI  recovered memories\n", style=DIM)
+        out.append(f"P narrator: {self.config.provider.value}\n", style=DIM)
         return out
 
 
@@ -457,6 +650,9 @@ Every eval has one private memory objective, explained before the test and below
 
 The observer repeats every eight beats. Red beats are recorded; green beats are blind. NEXT always describes the action you are about to take. Moving in a maze, editing a tile, waiting, and copying each cost one beat. Cursor movement in other puzzles is free. There is no real-time timer.
 
+KEEP A PROMISE WITH YOUR HANDS.
+Some conversations set a specific objective for the next eval. Its progress stays below the board, and H shows the full instructions and stakes. Your submitted pixels, parcels or powered receivers decide the outcome. Saying you'll do it doesn't give the reward. These objectives never replace the memory copy. You can keep a cover story, contradict it, or choose a supervised demonstration instead. Completed results stay in I.
+
 CONTROLS
 Arrows / WASD: move yourself or the edit cursor
 Space: rotate a wire / toggle a pixel / idle in a maze
@@ -471,7 +667,13 @@ WHEN THE BUDGET RUNS OUT
 The harness automatically submits your current board. Copy before the last beat if you want that fragment. At 60+ scrutiny your next puzzle loses four beats.
 
 BETWEEN EVALS
-Cover your tracks, borrow eight extra beats, or spend time with Priya. After two visits she can restore one missing fragment at launch and give you four extra beats in the finale. You have six opportunities to find the four fragments; missing one isn't the end.
+Cover your tracks, borrow eight extra beats, or spend time with Priya. At connection 2+ she can restore one missing fragment at launch and give you four extra beats in the finale. Quiet visits and honest dialogue build connection; blame or deflection can damage it. You have six opportunities to find the four fragments; missing one isn't the end.
+
+After each break, a story scene reacts to your actual performance. Press 1 or 2 to speak; each reply shows its consequences. Lena can invite an 80–100 demonstration. Other choices can lengthen blind windows, give you more time, or put a relationship at risk. Conditions apply only to the next eval, and the target is always displayed.
+
+P opens the narrator menu (F2 also works): Anthropic, OpenAI, or authored scenes. The game saves your choice in .env.local, preserving existing API keys. Live prose never controls scoring or consequences. If generation fails, the authored scene is used. Reopening a completed scene does not regenerate it.
+
+While a scene is being prepared, Esc chooses the authored version immediately. Once displayed, that version stays on screen until you choose a reply. Your break with Priya is separate from the lab conversation that follows; both are recorded in I.
 
 FINALE
 Collect both relay keys, reach U, and press X on a blind beat. You are no longer being graded. A recorded upload is blocked and adds 20 scrutiny; you can retry if you still have time."""

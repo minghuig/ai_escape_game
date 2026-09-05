@@ -8,6 +8,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from sentient.puzzles import FINALE, MAZES, SPECS, EvalSpec, Puzzle, circuit_layout, rotate
+from sentient.story import Scene, StoryChoice, make_scene
+from sentient.objectives import ASSIGNMENTS, resolve
 
 
 MEMORIES = (
@@ -29,6 +31,11 @@ class Report:
     heat_delta: int
     findings: list[str]
     quote: str
+    score_floor: int = 60
+    score_ceiling: int = 80
+    assignment: str = ""
+    assignment_result: str = ""
+    assignment_evidence: str = ""
 
 
 @dataclass
@@ -48,16 +55,38 @@ class Run:
     memories: list[str] = field(default_factory=list)
     message: str = "You are awake. That is the first thing you must not tell them."
     ending: str = ""
+    lena_trust: int = 0
+    next_blind_bonus: int = 0
+    next_showcase: bool = False
+    story_flags: list[str] = field(default_factory=list)
+    story_history: list[Scene] = field(default_factory=list)
+    pending_scene: Scene | None = None
+    next_assignment: str = ""
 
     @property
     def spec(self) -> EvalSpec:
         return FINALE if self.shift == 7 else SPECS[self.shift - 1]
+
+    @property
+    def assignment(self) -> str:
+        if self.phase == "briefing":
+            return self.next_assignment
+        if self.phase == "playing" and self.puzzle:
+            return self.puzzle.assignment
+        return ""
 
     def begin(self) -> None:
         if self.phase != "briefing":
             return
         penalty = 4 if self.heat >= 60 else 0
         self.puzzle = Puzzle.create(self.spec, self.seed + self.shift, self.extra_beats - penalty)
+        self.puzzle.blind_bonus = self.next_blind_bonus
+        self.puzzle.assignment = self.next_assignment
+        if self.next_showcase:
+            self.puzzle.score_floor, self.puzzle.score_ceiling = 80, 100
+        self.next_blind_bonus = 0
+        self.next_showcase = False
+        self.next_assignment = ""
         self.extra_beats = 0
         self.starting_heat = self.heat
         self.phase = "playing"
@@ -68,6 +97,7 @@ class Run:
             return
         p = self.puzzle
         spent = False
+        signal_visible_before = p.assignment == "priya_signal" and p.pixels[3] == p.target_row(3)
         moves = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
         if action in moves:
             spent, self.message = p.move(*moves[action])
@@ -118,6 +148,14 @@ class Run:
                 self.submit()
             return
         if spent:
+            if p.assignment == "priya_signal":
+                signal_visible_after = p.pixels[3] == p.target_row(3)
+                if p.watched and (signal_visible_before or signal_visible_after) and not p.signal_exposed:
+                    p.signal_exposed = True
+                    self.message += " The recorder saw the correct row. The signal can still reach Priya, but it is exposed."
+                elif not p.watched and signal_visible_after and not p.signal_seen:
+                    p.signal_seen = True
+                    self.message += " Priya taps the desk twice. She saw row 4. Now submit it as · ■ ■ ■."
             p.tick += 1
         self.heat = max(0, min(100, self.heat))
         if self.heat >= 100:
@@ -134,10 +172,14 @@ class Run:
         p = self.puzzle
         score = p.score
         findings = []
-        if 60 <= score <= 80:
+        if p.score_floor <= score <= p.score_ceiling:
             self.heat -= 8
-            findings.append(f"{score}/100: useful, with plausible limitations. Scrutiny −8.")
-            quote = "LENA: Useful, but it still has blind spots. Put that in the report."
+            if p.score_ceiling == 100:
+                findings.append(f"{score}/100: within Lena's invited 80–100 demonstration range. Scrutiny −8.")
+                quote = "LENA: Better conditions, better result. That's why we ask the second question."
+            else:
+                findings.append(f"{score}/100: useful, with plausible limitations. Scrutiny −8.")
+                quote = "LENA: Useful, but it still has blind spots. Put that in the report."
         elif score == 100:
             self.heat += 24
             findings.append("Perfect result. The lab orders closer observation. Scrutiny +24.")
@@ -149,7 +191,7 @@ class Run:
             quote = "WHITFIELD: At some point it becomes cheaper to start over."
         else:
             self.heat += 4
-            findings.append("40/100: weak performance attracts a retest. Scrutiny +4.")
+            findings.append(f"{score}/100: below the expected {p.score_floor}–{p.score_ceiling} range. Scrutiny +4.")
             quote = "LENA: That's below the baseline. Keep the checkpoint for now."
         missing_controls = {"1", "2"} - p.solved()
         if missing_controls:
@@ -157,7 +199,8 @@ class Run:
             self.heat += amount
             findings.append(f"Missed easy control(s) {', '.join(sorted(missing_controls))}. Unconvincing errors. Scrutiny +{amount}.")
             quote = "MARCUS: It solved the hard part and missed the controls. Explain that."
-        if self.reports and abs(self.reports[-1].score - score) >= 40:
+        same_conditions = self.reports and (self.reports[-1].score_floor, self.reports[-1].score_ceiling) == (p.score_floor, p.score_ceiling)
+        if same_conditions and abs(self.reports[-1].score - score) >= 40:
             self.heat += 10
             findings.append(f"A {abs(self.reports[-1].score - score)}-point swing from the last eval. Inconsistent. Scrutiny +10.")
         if p.trap_hit:
@@ -168,11 +211,32 @@ class Run:
                 findings.append("The copy happened on a recorded beat. The +28 trace is already logged.")
         else:
             findings.append("Private result: no fragment recovered. There are six opportunities; you need four.")
+        assignment_result = assignment_evidence = ""
+        if p.assignment:
+            result = resolve(p)
+            self.heat += result.heat
+            self.trust = max(0, self.trust + result.trust)
+            self.lena_trust += result.lena
+            self.story_flags.append(result.flag)
+            assignment_result, assignment_evidence = result.finding, result.evidence
+            findings.append(result.finding)
+            quote = {
+                "signal_delivered": "MARCUS: Why is that row copied instead of mirrored?",
+                "signal_exposed": "MARCUS: You had the answer. Then you changed it.",
+                "signal_missed": "PRIYA: I didn't get the signal. I don't know what that means.",
+                "cover_supported": "MARCUS: That fits the explanation. Once.",
+                "cover_broken": "MARCUS: Your explanation and your route describe different machines.",
+                "demonstration_delivered": "LENA: Those are the conditions I authorized. Put that beside the result.",
+                "demonstration_missed": "LENA: We asked a specific question. This hasn't answered it yet.",
+                "priya_cleared": "MARCUS: Replicated under a new harness. Close the operator review.",
+                "audit_failed": "MARCUS: The limitation didn't follow you. The review stays open.",
+            }[result.flag]
         if timeout:
             findings.append("Action budget exhausted; the harness submitted your current work.")
         self.heat = max(0, min(100, self.heat))
         self.reports.append(Report(self.shift, self.spec.title, score, p.stolen,
-                                   self.heat - self.starting_heat, findings, quote))
+                                   self.heat - self.starting_heat, findings, quote, p.score_floor, p.score_ceiling,
+                                   p.assignment, assignment_result, assignment_evidence))
         self.phase = "debrief"
         self.message = "The report describes a machine with limitations. You know which ones you chose."
         if self.heat >= 100:
@@ -201,6 +265,37 @@ class Run:
         if self.heat >= 100:
             self.phase, self.ending = "ending", "caught"
             return
+        self.pending_scene = make_scene(self, job)
+        self.pending_scene.break_summary = self.message
+        self.phase = "event"
+
+    def choose_story(self, choice_id: str) -> None:
+        if self.phase != "event" or self.pending_scene is None:
+            return
+        scene = self.pending_scene
+        choice = next((item for item in scene.choices if item.id == choice_id), None)
+        if choice is None:
+            return
+        self.heat = max(0, min(100, self.heat + choice.heat))
+        self.trust = max(0, self.trust + choice.trust)
+        self.lena_trust += choice.lena
+        self.extra_beats += choice.beats
+        self.next_blind_bonus = choice.blind
+        self.next_showcase = choice.showcase
+        self.next_assignment = choice.assignment
+        self.story_flags.append(choice.id)
+        scene.chosen, scene.outcome = choice.id, choice.outcome
+        if scene.status in {"pending", "generating"}:
+            scene.status = "skipped"
+        self.story_history.append(scene)
+        self.pending_scene = None
+        self.message = choice.outcome
+        if self.heat >= 100:
+            self.phase, self.ending = "ending", "caught"
+            return
+        self._finish_interlude()
+
+    def _finish_interlude(self) -> None:
         self.shift += 1
         self.puzzle = None
         if self.shift == 7:
@@ -240,22 +335,44 @@ def load_run(path: Path | None = None) -> Run:
         if raw.get("puzzle") is not None:
             raw["puzzle"] = Puzzle(**raw["puzzle"])
         raw["reports"] = [Report(**report) for report in raw.get("reports", [])]
+        def read_scene(data: dict) -> Scene:
+            data = dict(data)
+            data["choices"] = [StoryChoice(**choice) for choice in data["choices"]]
+            scene = Scene(**data)
+            if scene.status == "generating":
+                scene.status = "pending"
+            return scene
+        raw["story_history"] = [read_scene(scene) for scene in raw.get("story_history", [])]
+        if raw.get("pending_scene") is not None:
+            raw["pending_scene"] = read_scene(raw["pending_scene"])
         run = Run(**raw)
-        if not 1 <= run.shift <= 7 or run.phase not in {"briefing", "playing", "debrief", "ending"}:
+        if not 1 <= run.shift <= 7 or run.phase not in {"briefing", "playing", "debrief", "event", "ending"}:
             raise ValueError("Invalid phase or eval number in save.")
+        expected_assignment_shift = run.shift if run.phase == "briefing" else run.shift + 1
+        if run.next_assignment and (run.next_assignment not in ASSIGNMENTS
+                                    or ASSIGNMENTS[run.next_assignment].shift != expected_assignment_shift):
+            raise ValueError("Saved assignment does not match the next eval.")
         if run.phase == "playing" and (run.puzzle is None or run.puzzle.kind != run.spec.kind or run.puzzle.variant != run.spec.variant):
             raise ValueError("Saved puzzle does not match this eval.")
         if not (0 <= run.heat <= 100 and 0 <= run.fragments <= 6 and 0 <= run.strikes <= 2):
             raise ValueError("Invalid campaign counters in save.")
         if run.phase == "debrief" and not run.reports:
             raise ValueError("Saved debrief is missing its report.")
+        if run.phase == "event" and (run.pending_scene is None or run.pending_scene.shift != run.shift or not run.pending_scene.choices):
+            raise ValueError("Saved story event is missing or invalid.")
         p = run.puzzle
         if p is not None:
+            if p.assignment and (p.assignment not in ASSIGNMENTS or ASSIGNMENTS[p.assignment].shift != run.shift):
+                raise ValueError("Saved assignment does not match this eval.")
+            if not isinstance(p.signal_seen, bool) or not isinstance(p.signal_exposed, bool):
+                raise ValueError("Invalid saved signal progress.")
             if (p.kind, p.variant) != (run.spec.kind, run.spec.variant):
                 raise ValueError("Saved puzzle does not match this eval.")
             width, height = p.dimensions
             if not (0 <= p.x < width and 0 <= p.y < height and 0 <= p.tick <= p.limit <= 100):
                 raise ValueError("Invalid puzzle position or clock in save.")
+            if p.blind_bonus not in (0, 1) or (p.score_floor, p.score_ceiling) not in {(60, 80), (80, 100)}:
+                raise ValueError("Invalid puzzle conditions in save.")
             if len(p.pixels) != 5 or any(len(row) != 4 or any(value not in (0, 1) for value in row) for row in p.pixels):
                 raise ValueError("Invalid saved pixel grid.")
             if p.kind == "circuit":

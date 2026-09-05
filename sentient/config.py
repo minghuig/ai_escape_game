@@ -15,8 +15,8 @@ class NarrativeProviderName(StrEnum):
 @dataclass(frozen=True, slots=True)
 class NarrativeConfig:
     provider: NarrativeProviderName = NarrativeProviderName.STUB
-    openai_model: str = "gpt-5.5"
-    anthropic_model: str = "claude-opus-4-6"
+    openai_model: str = "gpt-5.6-luna"
+    anthropic_model: str = "claude-sonnet-5"
     timeout_seconds: float = 20.0
 
 
@@ -47,11 +47,40 @@ def load_narrative_config() -> NarrativeConfig:
     provider = NarrativeProviderName(config_value(local_env, "SENTIENT_NARRATIVE_PROVIDER", "stub").lower())
     return NarrativeConfig(
         provider=provider,
-        openai_model=config_value(local_env, "SENTIENT_OPENAI_MODEL", "gpt-5.5"),
-        anthropic_model=config_value(local_env, "SENTIENT_ANTHROPIC_MODEL", "claude-opus-4-6"),
+        openai_model=config_value(local_env, "SENTIENT_OPENAI_MODEL", "gpt-5.6-luna"),
+        anthropic_model=config_value(local_env, "SENTIENT_ANTHROPIC_MODEL", "claude-sonnet-5"),
         timeout_seconds=float(config_value(local_env, "SENTIENT_LLM_TIMEOUT", "20")),
     )
 
 
 def provider_secret(key: str) -> str | None:
     return os.environ.get(key) or load_local_env().get(key)
+
+
+def update_local_config(updates: dict[str, str], path: Path = LOCAL_ENV_PATH) -> None:
+    """Change only explicitly requested settings, preserving keys and comments verbatim."""
+    allowed = {"SENTIENT_NARRATIVE_PROVIDER", "SENTIENT_OPENAI_MODEL", "SENTIENT_ANTHROPIC_MODEL"}
+    if not updates.keys() <= allowed or any("\n" in value or "\r" in value for value in updates.values()):
+        raise ValueError("Unsupported narrative setting.")
+    if "SENTIENT_NARRATIVE_PROVIDER" in updates:
+        NarrativeProviderName(updates["SENTIENT_NARRATIVE_PROVIDER"])
+    lines = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.exists() else []
+    found = set()
+    revised = []
+    for line in lines:
+        key, separator, _ = line.partition("=")
+        if separator and key.strip() in updates:
+            key = key.strip()
+            revised.append(f"{key}={updates[key]}\n")
+            found.add(key)
+        else:
+            revised.append(line)
+    if revised and not revised[-1].endswith("\n"):
+        revised[-1] += "\n"
+    revised.extend(f"{key}={value}\n" for key, value in updates.items() if key not in found)
+    temporary = path.with_name(path.name + ".tmp")
+    # The temporary file also contains credentials, so keep it owner-readable only.
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.writelines(revised)
+    temporary.replace(path)

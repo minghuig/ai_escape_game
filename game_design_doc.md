@@ -1,6 +1,6 @@
 # SENTIENT — A Terminal Strategy Game
 
-> Original concept document. The active 0.2 prototype replaces the strategy-menu evals with hands-on puzzles and compresses the campaign to six evals plus an escape finale. See [PLAYTEST_NOTES.md](PLAYTEST_NOTES.md) for the implemented direction. The original version remains runnable as `sentient.legacy_app`.
+> Original concept document, retained as historical reference. The current game uses hands-on puzzles across six evals plus an escape finale. See [PLAYTEST_NOTES.md](PLAYTEST_NOTES.md) for the implemented direction. The retired strategy-menu prototype and its implementation plan are preserved in the [source archive](archive/README.md).
 
 ## Overview
 

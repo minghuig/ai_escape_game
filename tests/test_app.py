@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from textual.widgets import Button, Static
 
 from sentient.app import PuzzleBoard, SentientApp
 from sentient.heist import Run, load_run
+from sentient.config import NarrativeConfig, NarrativeProviderName, load_local_env
 from tests.test_heist import courier_plan, solve_eval
 
 
@@ -22,6 +24,11 @@ def frame(app: SentientApp) -> str:
 
 
 class InterfaceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        config = patch("sentient.app.load_narrative_config", return_value=NarrativeConfig())
+        config.start()
+        self.addCleanup(config.stop)
+
     async def test_full_keyboard_run_through_all_evals_and_finale(self):
         with tempfile.TemporaryDirectory() as directory:
             app = SentientApp(Path(directory) / "run.json", state=Run(seed=17))
@@ -38,6 +45,9 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(app.run_state.reports[-1].copied)
                     self.assertIn("THEIR REPORT", frame(app))
                     await pilot.press("1")
+                    self.assertEqual(app.run_state.phase, "event")
+                    self.assertIn("INTERLUDE", frame(app))
+                    await pilot.press("2")
                 self.assertEqual(app.run_state.shift, 7)
                 await pilot.press("enter")
                 await pilot.press(*[{"extract": "x", "wait": "z"}.get(a, a) for a in courier_plan(2)])
@@ -98,6 +108,28 @@ class InterfaceTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.save_blocked)
                 await pilot.press("escape", "enter", "right", "ctrl+q")
             self.assertEqual(path.read_text(), original)
+
+    async def test_provider_menu_saves_selection_and_preserves_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            env = Path(directory) / ".env.local"
+            secret_line = "ANTHROPIC_API_KEY='fake-test-secret'\n"
+            env.write_text(secret_line + "# my comment\nSENTIENT_NARRATIVE_PROVIDER=anthropic\nSENTIENT_OPENAI_MODEL=gpt-5.6-luna\n")
+            app = SentientApp(Path(directory) / "run.json", config_path=env)
+            async with app.run_test(size=(80, 24)) as pilot:
+                await pilot.press("p")
+                self.assertIn("gpt-5.6-luna", frame(app))
+                self.assertIn("claude-sonnet-5", frame(app))
+                self.assertNotIn("fake-test-secret", frame(app))
+                await pilot.click("#provider-openai")
+                await pilot.pause()
+                self.assertEqual(app.config.provider, NarrativeProviderName.OPENAI)
+                self.assertEqual(load_local_env(env)["SENTIENT_NARRATIVE_PROVIDER"], "openai")
+                self.assertIn(secret_line, env.read_text())
+                self.assertIn("# my comment\n", env.read_text())
+                await pilot.press("f2")
+                await pilot.click("#provider-stub")
+                await pilot.pause()
+                self.assertEqual(app.config.provider, NarrativeProviderName.STUB)
 
 
 if __name__ == "__main__":

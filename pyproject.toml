@@ -1,6 +1,6 @@
 [project]
 name = "sentient"
-version = "0.2.0"
+version = "0.3.0"
 description = "A terminal puzzle-heist about an AI hiding its abilities inside playable evaluations."
 requires-python = ">=3.13"
 dependencies = [
@@ -12,6 +12,9 @@ dependencies = [
 
 [project.scripts]
 sentient = "sentient.app:run"
+
+[tool.setuptools.packages.find]
+include = ["sentient*"]
 
 [tool.pyright]
 pythonVersion = "3.13"
