@@ -15,7 +15,6 @@ from sentient.heist import Run, load_run, save_run
 from sentient.objectives import ASSIGNMENTS, ready
 from sentient.puzzles import E, N, S, W, MAZES, circuit_layout
 from sentient.story import epilogue
-from sentient.story_narrative import scene_context
 from tests.test_app import RecordingRun, frame
 from tests.test_heist import MOVES, clean_copy, courier_plan, finish_break, move_cursor, solve_eval
 
@@ -110,7 +109,7 @@ class PromiseTests(unittest.TestCase):
         self.assertEqual(run.trust, before_trust + 1)
         run.prepare("scrub")
         self.assertEqual(run.pending_scene.id, "a_particular_wrong_answer")
-        evidence = scene_context(run, run.pending_scene)["evidence"]
+        evidence = run.pending_scene.evidence
         self.assertTrue(any("Marcus sees only" in fact for fact in evidence))
         run.choose_story("claimed_limit")
         run.begin()

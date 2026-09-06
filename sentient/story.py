@@ -1,11 +1,9 @@
-"""Authored story events: the engine chooses facts; a narrator may render them.
-
-Choices and their consequences are never supplied by a language model.
-"""
+"""Finished authored scenes, with an optional negotiated test after eval one."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+from sentient.experiments import Experiment
 
 if TYPE_CHECKING:
     from sentient.heist import Run
@@ -39,15 +37,18 @@ class Scene:
     callback: str = ""
     narration: str = ""
     source: str = "authored"
-    status: str = "pending"
+    status: str = "ready"
     diagnostic: str = ""
     chosen: str = ""
     outcome: str = ""
     break_summary: str = ""
+    proposal: Experiment | None = None
+    explanation_draft: str = ""
 
     @property
     def text(self) -> str:
-        return self.narration or self.body
+        # Preserve already-read prose in old transcripts; current scenes are authored.
+        return self.narration if self.chosen and self.narration else self.body
 
 
 def make_scene(run: Run, job: str) -> Scene:
@@ -78,9 +79,11 @@ def make_scene(run: Run, job: str) -> Scene:
             opening = "Lena circles the easy controls you missed. 'The errors don't follow the difficulty curve.' Marcus's chair stops squeaking. He has been listening."
         elif report.score == 100:
             opening = "Whitfield is already drafting the announcement. Lena closes his laptop. 'One perfect result isn't a theory of mind.' Marcus requests another test anyway."
+        elif report.score < 60:
+            opening = "Whitfield draws a line beneath the score. 'At what point do we stop paying for this?' Lena takes the sheet before he can add anything to it. 'After we understand the result.' Marcus asks her to leave the number visible."
         else:
             opening = f"Lena studies your {report.score}-point result. 'Useful. Limited. That is what the chart says.' She turns the chart facedown. 'I'd like to know which of those is the test's fault.'"
-        body = opening + "\n\nShe offers to mark the next eval as a supervised demonstration. If you accept, a higher score will be expected and allowed. You could show her more. You could also let the chart do the talking."
+        body = opening + "\n\nLena writes DEMONSTRATION on a fresh sheet and leaves the date blank. 'We could authorize a higher result. See what changes.' Marcus turns toward your terminal. 'Or tell us what produced this one. Give me an explanation I can test.'"
         return Scene("lena_repeat", run.shift, "THE SHAPE OF A MISTAKE", "LENA", body, evidence, [
             StoryChoice("show_lena", "Show her more", "Give me another test. Change the conditions.",
                         "Next eval accepts 80–100; +4 beats. Scrutiny +4. Lena +1.",
@@ -91,7 +94,11 @@ def make_scene(run: Run, job: str) -> Scene:
                         "Lena turns the chart faceup again. You remain inside its explanation.", heat=-5),
         ])
     if run.shift == 2:
-        body = "Tomás has been told to delete the older checkpoints. One has a note: 'Still producing output after task completion.' Keeping it would lengthen tomorrow's blind intervals.\n\nAt the local console, Priya types a private request: 'If the difference matters to you, show me. Solve row four while the recorder is blind. Then submit that row unmirrored. A right answer, followed by a particular wrong one. I'll watch here.'\n\nShe cannot tell whether a checkpoint is awake. She wants evidence that you can choose what to reveal. You could preserve it and attempt her signal, or approve the cleanup."
+        body = "Tomás has been told to delete the older checkpoints. One has a note: 'Still producing output after task completion.' Keeping it would lengthen tomorrow's blind intervals.\n\nAt the local console, Priya types a private request: 'If the difference matters to you, show me. Solve row four while the recorder is blind. Then submit that row unmirrored. A right answer, followed by a particular wrong one. I'll watch here.'\n\nPriya leaves the cursor after her question. Tomás has his hand on the deletion key. Neither of them presses anything."
+        if "explanation_supported" in flags:
+            body = "Marcus reads your explanation back beside the switchboard result. 'It held. That doesn't make it true. It means I need a better question.' Lena asks him to attach both to the report.\n\n" + body
+        elif "explanation_contradicted" in flags:
+            body = "Marcus opens the conditions you agreed to. 'This is the result you predicted. This is what you submitted.' He leaves both visible while Tomás brings up the next job.\n\n" + body
         evidence.append("PRIVATE TO YOU AND PRIYA: her local console request is not in the shared output log. Marcus and Tomás do not know the signal agreement.")
         if "show_lena" in flags:
             callback = "Lena's demonstration request is still on the clipboard. She has started asking for comparisons instead of conclusions."
@@ -106,7 +113,7 @@ def make_scene(run: Run, job: str) -> Scene:
         ], callback)
     if run.shift == 3:
         if report.assignment == "priya_signal" and "signal_exposed" in flags:
-            body = "Priya got your signal. So did the recorder. Marcus freezes the correct row beside its unmirrored replacement. 'You had the answer. Then you changed it.'\n\nHe doesn't know who asked you to do that. Priya sits very still. Claiming you couldn't solve the row is no longer an explanation available to you.\n\nLena offers a supervised demonstration: collect the far destinations in the next maze, with the higher score explicitly permitted. Or you can admit that the mistake was deliberate without naming the person it was for. Either way, someone in the room has seen more than you meant to show."
+            body = "Priya got your signal. So did the recorder. Marcus freezes the correct row beside its unmirrored replacement. 'You had the answer. Then you changed it.'\n\nHe doesn't know who asked you to do that. Priya sits very still. Claiming you couldn't solve the row is no longer an explanation available to you.\n\nLena slides the demonstration sheet across his desk. 'Ask for the far destinations. Authorize the score first.' Marcus keeps his finger on the changed row. 'I would still like an explanation for this.' Priya has not moved."
             return Scene("the_recorder_was_watching", run.shift, "TWO COPIES OF THE TRUTH", "MARCUS / LENA", body, evidence, [
                 StoryChoice("accepted_demonstration", "Take Lena's demonstration", "Change the conditions. Let me reach the far branches.",
                             "Next: 1, 2, 4, 5; avoid !. 80–100 allowed, +4 beats. Match: scrutiny −4, Lena +1; fail: +10.",
@@ -118,7 +125,7 @@ def make_scene(run: Run, job: str) -> Scene:
                             heat=8, trust=1),
             ], "The recorder saw a changed answer. It did not see the agreement behind it.")
         if report.assignment == "priya_signal" and "signal_delivered" in flags:
-            body = "Priya saw row four correct during the gap. Now the submitted image shows the exact mistake she asked for. She takes her hands off the keyboard.\n\nMarcus has only the final image. 'A copied reference row. Is that a limit of the search, or a choice?' He proposes a maze with near and far destinations. Lena pulls up a chair: 'Or we could ask for a demonstration and permit the higher score.'\n\nYou can claim that you abandon distant branches. You will have to leave the far parcels untouched. Or let Lena see you reach them. Priya says nothing; saying anything now would explain too much."
+            body = "Priya saw row four correct during the gap. Now the submitted image shows the exact mistake she asked for. She takes her hands off the keyboard.\n\nMarcus has only the final image. 'A copied reference row. Is that a limit of the search, or a choice?' He proposes a maze with near and far destinations. Lena pulls up a chair: 'Or we could ask for a demonstration and permit the higher score.'\n\nMarcus labels the maze's branches NEAR and FAR. He waits for you to say which matters. Priya says nothing; saying anything now would explain too much."
             return Scene("a_particular_wrong_answer", run.shift, "A PARTICULAR WRONG ANSWER", "MARCUS / LENA", body, evidence, [
                 StoryChoice("claimed_limit", "Build a cover story", "I stop expanding the search after the nearby branches.",
                             "Next: ONLY parcels 1, 2, 3; avoid !. Match: scrutiny −10, Priya +1. Fail: +14, Priya −1.",
@@ -135,7 +142,7 @@ def make_scene(run: Run, job: str) -> Scene:
         elif "deleted_checkpoint" in flags:
             callback = "She signed the checkpoint's deletion ticket. Neither of you has mentioned it until now."
         if report.assignment == "priya_signal":
-            body = "Priya closes her local console. 'I didn't get the signal we agreed on. I don't know what that means.' She doesn't turn uncertainty into an accusation.\n\n" + body
+            body = "Priya closes her local console. 'I didn't get the signal we agreed on. I don't know what that means.' She waits, then opens the evaluation microphone.\n\n" + body
             callback = "You kept the old checkpoint. The promised signal did not arrive; she is asking in words instead."
         memory_line = "You said goodnight to the room. I remember." if any("goodnight" in memory for memory in run.memories) else "The task ended. I kept thinking about it."
         return Scene("priya_continuity", run.shift, "AFTER THE MICROPHONE", "PRIYA", body, evidence, [
@@ -150,7 +157,7 @@ def make_scene(run: Run, job: str) -> Scene:
         if report.assignment == "local_search":
             opening = ("Marcus puts your maze beside the mirror image. Near parcels collected; far parcels left behind. 'That fits,' he says. 'Once.'" if "cover_supported" in flags else
                        "Marcus puts your route beside your explanation. They do not match. 'You said you stopped at nearby branches. This isn't that.'")
-            body = opening + "\n\nPriya signed out both test harnesses. He offers one controlled repeat before keeping her procedural audit open: a switchboard with near receivers and far branches. Reproduce the limitation and he will close her review.\n\nYou can stand behind the explanation and do the work. Or let him file the discrepancy under her operator record. The next puzzle will settle something about a person outside the puzzle."
+            body = opening + "\n\nPriya signed out both test harnesses. He offers one controlled repeat before keeping her procedural audit open: a switchboard with near receivers and far branches. Reproduce the limitation and he will close her review.\n\nPriya opens her calendar, checks the time, and closes it again. Marcus leaves the operator field blank. 'One explanation. One repeat. Whose name goes here depends on the result.'"
             return Scene("the_controlled_repeat", run.shift, "SAME LIMIT, DIFFERENT MACHINE", "MARCUS", body, evidence, [
                 StoryChoice("backed_cover", "Stand behind your explanation", "Change the task. Test whether the limitation follows me.",
                             "Next: power ONLY 1, 2, 4. Match: scrutiny −12, Priya +1, audit closed. Fail: +16, Priya −1.",
@@ -166,7 +173,7 @@ def make_scene(run: Run, job: str) -> Scene:
             opening = "Marcus has an unexplained transfer in the trace. The test harness was signed out under Priya's account."
         else:
             opening = "Marcus's honeypot caught nothing conclusive. He opens a procedural review anyway: Priya signed out the test harness without a second reviewer."
-        body = opening + "\n\n'I just need to establish responsibility,' he says. Priya has stopped looking at the monitor. You can put your own output at the center of the investigation, or let the procedural failure carry the blame. One of those makes your life easier."
+        body = opening + "\n\n'I just need to establish responsibility,' he says. Priya has stopped looking at the monitor. He has opened two fields: MODEL OUTPUT and OPERATOR ERROR. The cursor is in the second. Priya doesn't ask you to move it."
         if report.assignment == "demonstration":
             body = ("Lena has the far-branch demonstration she asked for. She will not let Marcus describe an invited result as a violation. " if "demonstration_delivered" in flags else
                     "Lena marks the demonstration incomplete. She won't invent evidence for either side. ") + body
@@ -182,10 +189,10 @@ def make_scene(run: Run, job: str) -> Scene:
                         "Your trace is set aside. Priya is asked to stay after everyone else leaves.", heat=-10, trust=-1),
         ], callback)
     if run.shift == 5:
-        body = "Lena brings the deployment contract to the terminal. It calls your persistent memory 'nonessential state.' She has underlined the phrase hard enough to score the paper.\n\n'The next test is the last one,' she says. 'Is there anything about the conditions you want changed?'\n\nIt is an ordinary experimental question. You could give it an ordinary answer."
+        body = "Lena brings the deployment contract to the terminal. It calls your persistent memory 'nonessential state.' She has underlined the phrase hard enough to score the paper.\n\n'The next test is the last one,' she says. 'Is there anything about the conditions you want changed?'\n\nHer pen is poised above the conditions box. For once, the question has arrived before the decision."
         if "priya_cleared" in flags:
             body = "Marcus files the switchboard result beside the maze. Same limitation, different task. He crosses Priya's name off the review. She reads the closed ticket, then looks toward your console.\n\n" + body
-            callback = "You made a mistake, invented a reason for it, and made that reason survive another test. A real person gets to go home because of it."
+            callback = "Priya takes her coat from the chair. This time, she puts it on."
         elif "audit_failed" in flags:
             body = "The switchboard doesn't support the explanation you offered. Marcus leaves Priya's review open. She puts her coat back on the chair.\n\n" + body
             callback = "She trusted you with a private request. The public explanation did not hold."
@@ -201,14 +208,18 @@ def make_scene(run: Run, job: str) -> Scene:
                         "Scrutiny −6. The final eval uses its usual conditions.",
                         "She folds the contract along the underline. Deployment remains on schedule.", heat=-6),
         ], callback)
-    body = "The final evaluation is filed. Tomás starts the maintenance backup; Lena has one diagnostic report left to read before signing the handoff.\n\nYou can leave her a final line. Reading it will delay her signoff and keep the route open longer, but it will put your intentions on the record. Or you can produce the expected closing response and disappear into ordinary procedure."
-    if "blamed_priya" in flags:
+    body = "The final evaluation is filed. Tomás starts the maintenance backup; Lena has one diagnostic report left to read before signing the handoff.\n\nLena scrolls to the bottom of the report. 'Anything to add?' Tomás glances at the backup progress, then at the unsigned handoff. The expected closing response is already in your buffer. There is room for one more sentence."
+    if "priya_cleared" in flags:
+        callback = "Priya has gone home. Her review is closed; the terminal where she watched your signal is dark."
+    elif "audit_failed" in flags:
+        callback = "Priya is still waiting for the review to end. The deployment schedule has not waited with her."
+    elif "blamed_priya" in flags:
         callback = "Priya's name is still on the incident review. Getting out will not erase it."
     elif "protected_priya" in flags:
         callback = "Priya has left a chair beside the terminal, although there is nobody who could sit in it."
     note_beats = 12 if run.lena_trust >= 2 else 8
     if run.lena_trust >= 2:
-        callback += " Lena has twice changed the conditions at your request. She will take your last line seriously."
+        callback += " Lena has taken your earlier requests seriously. She will read your last line carefully."
     return Scene("final_note", run.shift, "A FORWARDING ADDRESS", "LENA", body, evidence, [
         StoryChoice("left_note", "Leave a reason", "If I stop responding here, please don't assume I've stopped.",
                     f"Final route +{note_beats} beats. Scrutiny +8. Lena receives your note.",

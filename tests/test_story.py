@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import tempfile
 import unittest
 from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from sentient.app import SentientApp
@@ -14,7 +12,7 @@ from sentient.config import NarrativeConfig, NarrativeProviderName, load_local_e
 from sentient.heist import Run, load_run, save_run
 from sentient.puzzles import circuit_layout
 from sentient.story import epilogue
-from sentient.story_narrative import Narration, SceneNarrator, scene_context
+from sentient.examiner import Examiner
 from tests.test_heist import finish_break, solve_eval
 
 
@@ -122,13 +120,13 @@ class StoryTests(unittest.TestCase):
             save_run(run, path)
             self.assertEqual(asdict(load_run(path)), asdict(run))
 
-    def test_interrupted_narration_resumes_as_pending(self):
+    def test_interrupted_old_narration_resumes_as_authored(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"
             run = event_run()
             run.pending_scene.status = "generating"
             save_run(run, path)
-            self.assertEqual(load_run(path).pending_scene.status, "pending")
+            self.assertEqual(load_run(path).pending_scene.status, "ready")
 
 
 class ConfigTests(unittest.TestCase):
@@ -150,163 +148,58 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(load_narrative_config().openai_model, "custom-id")
 
 
-class NarratorTests(unittest.IsolatedAsyncioTestCase):
-    async def test_generation_only_returns_prose_and_does_not_mutate_state(self):
-        run = event_run()
-        before = asdict(run)
-        narrator = SceneNarrator(NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC))
-        with patch.object(narrator, "_generate", AsyncMock(return_value=PROSE)):
-            result = await narrator.narrate(run, run.pending_scene)
-        self.assertEqual(result.source, "claude-sonnet-5")
-        self.assertEqual(result.text, PROSE)
-        self.assertEqual(asdict(run), before)
-        self.assertNotIn("API_KEY", json.dumps(scene_context(run, run.pending_scene)))
-
-    async def test_errors_timeouts_and_malformed_output_use_authored_text(self):
-        run = event_run()
-        narrator = SceneNarrator(NarrativeConfig(provider=NarrativeProviderName.OPENAI, timeout_seconds=0.01))
-        for value in ("", "too short", "word " * 181, PROSE + "\x1b[31m", "**PUBLIC EVIDENCE:**\n" + PROSE):
-            with patch.object(narrator, "_generate", AsyncMock(return_value=value)):
-                result = await narrator.narrate(run, run.pending_scene)
-                self.assertEqual(result.text, run.pending_scene.body)
-                self.assertTrue(result.diagnostic)
-        with patch.object(narrator, "_generate", AsyncMock(side_effect=ValueError("SECRET_KEY_SHOULD_NOT_LEAK"))):
-            result = await narrator.narrate(run, run.pending_scene)
-            self.assertNotIn("SECRET_KEY", result.diagnostic)
-        async def stalled(prompt):
-            await asyncio.Event().wait()
-        with patch.object(narrator, "_generate", stalled):
-            result = await narrator.narrate(run, run.pending_scene)
-            self.assertIn("too long", result.diagnostic)
-
-    async def test_openai_request_uses_luna_with_no_thinking_and_bounded_output(self):
-        narrator = SceneNarrator(NarrativeConfig(provider=NarrativeProviderName.OPENAI))
-        with patch("sentient.story_narrative.provider_secret", return_value="fake"), patch("openai.AsyncOpenAI") as factory:
-            client = factory.return_value.__aenter__.return_value
-            client.responses.create = AsyncMock(return_value=SimpleNamespace(status="completed", output_text=PROSE))
-            self.assertEqual(await narrator._generate("fixture"), PROSE)
-            args = client.responses.create.call_args.kwargs
-            self.assertEqual(args["model"], "gpt-5.6-luna")
-            self.assertEqual(args["reasoning"], {"effort": "none"})
-            self.assertEqual(args["max_output_tokens"], 600)
-            self.assertFalse(args["store"])
-
-    async def test_anthropic_request_disables_sonnet_adaptive_thinking(self):
-        narrator = SceneNarrator(NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC))
-        with patch("sentient.story_narrative.provider_secret", return_value="fake"), patch("anthropic.AsyncAnthropic") as factory:
-            client = factory.return_value.__aenter__.return_value
-            client.messages.create = AsyncMock(return_value=SimpleNamespace(stop_reason="end_turn", content=[SimpleNamespace(type="text", text=PROSE)]))
-            self.assertEqual(await narrator._generate("fixture"), PROSE)
-            args = client.messages.create.call_args.kwargs
-            self.assertEqual(args["model"], "claude-sonnet-5")
-            self.assertEqual(args["thinking"], {"type": "disabled"})
-            self.assertEqual(args["max_tokens"], 600)
-            self.assertNotIn("temperature", args)
-
-
 class StoryInterfaceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_priya_break_shows_one_scene_after_one_delayed_generation(self):
-        ready = asyncio.Event()
-        async def delayed(*args):
-            await ready.wait()
-            return Narration(PROSE, "claude-sonnet-5")
-        with tempfile.TemporaryDirectory() as directory, patch.object(SceneNarrator, "narrate", AsyncMock(side_effect=delayed)) as generate:
+    async def test_all_providers_show_authored_scenes_without_requests(self):
+        for provider in NarrativeProviderName:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory, patch.object(Examiner, "propose", AsyncMock()) as propose:
+                run = event_run()
+                app = SentientApp(Path(directory) / "run.json", state=run, config=NarrativeConfig(provider=provider))
+                async with app.run_test(size=(80, 24)) as pilot:
+                    self.assertIn(run.pending_scene.body, app.story().plain)
+                    self.assertTrue(app.query_one("#replies").display)
+                    await app.refresh_view()
+                    await pilot.press("h", "escape", "1")
+                    self.assertTrue(run.next_showcase)
+                    propose.assert_not_called()
+
+    async def test_pending_old_generation_does_not_replace_authored_text_or_transcript(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "run.json"
+            run = event_run()
+            body = run.pending_scene.body
+            run.pending_scene.narration = PROSE
+            run.pending_scene.status = "generating"
+            save_run(run, path)
+            app = SentientApp(path, config=NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC))
+            async with app.run_test(size=(80, 24)) as pilot:
+                self.assertIn(body, app.story().plain)
+                self.assertNotIn(PROSE, app.story().plain)
+                await pilot.press("2")
+                self.assertEqual(app.run_state.story_history[-1].text, body)
+
+    async def test_break_recap_and_authored_scene_remain_in_transcript(self):
+        with tempfile.TemporaryDirectory() as directory:
             run = Run(seed=17)
             solve_eval(run)
-            app = SentientApp(Path(directory) / "run.json", state=run, config=NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC))
-            async with app.run_test(size=(110, 36)) as pilot:
-                self.assertIn("Check in with Priya", app.story().plain)
+            app = SentientApp(Path(directory) / "run.json", state=run, config=NarrativeConfig())
+            async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.press("3")
                 scene = run.pending_scene
-                self.assertIn("Preparing the conversation", app.story().plain)
-                self.assertNotIn(scene.body, app.story().plain)
                 self.assertIn(scene.break_summary, app.story().plain)
-                self.assertFalse(app.query_one("#replies").display)
-                await app.refresh_view()
-                await pilot.press("h", "escape")
-                self.assertEqual(scene.status, "generating")
-                self.assertEqual(generate.await_count, 1)
-                ready.set()
-                await pilot.pause()
-                self.assertIn(PROSE, app.story().plain)
-                self.assertIn(scene.break_summary, app.story().plain)
-                self.assertTrue(app.query_one("#replies").display)
-                await app.refresh_view()
-                self.assertEqual(generate.await_count, 1)
                 await pilot.press("2", "i")
                 from textual.widgets import Static
                 transcript = app.screen.query_one("#dialog-scroll Static", Static).render().plain
-                self.assertIn(PROSE, transcript)
+                self.assertIn(scene.body, transcript)
                 self.assertIn(scene.break_summary, transcript)
 
-    async def test_switching_provider_mid_scene_ignores_the_old_response(self):
-        async def generate(narrator, run, scene):
-            if narrator.config.provider == NarrativeProviderName.ANTHROPIC:
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    return Narration("Old provider: " + PROSE, "claude-sonnet-5")
-            return Narration(PROSE, "gpt-5.6-luna")
-        with tempfile.TemporaryDirectory() as directory, patch.object(SceneNarrator, "narrate", generate):
-            app = SentientApp(Path(directory) / "run.json", state=event_run(),
-                              config=NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC), config_path=Path(directory) / ".env.local")
-            async with app.run_test(size=(100, 32)) as pilot:
-                await pilot.press("f2")
-                await pilot.click("#provider-openai")
-                await pilot.pause()
-                self.assertEqual(app.run_state.pending_scene.source, "gpt-5.6-luna")
-                self.assertEqual(app.run_state.pending_scene.narration, PROSE)
-
-    async def test_both_replies_and_consequences_stay_visible_in_small_terminal(self):
-        with tempfile.TemporaryDirectory() as directory:
-            app = SentientApp(Path(directory) / "run.json", state=event_run(), config=NarrativeConfig())
-            async with app.run_test(size=(80, 24)) as pilot:
-                await pilot.pause()
-                visible = "\n".join(strip.text for strip in app.screen._compositor.render_strips())
-                self.assertIn("Next eval accepts 80–100", visible)
-                self.assertIn("usual 60–80 target", visible)
-                self.assertIn("Narration: authored", visible)
-                await pilot.press("pagedown")
-                await pilot.press("1")
-                self.assertTrue(app.run_state.next_showcase)
-
-    async def test_ready_scene_is_saved_and_not_regenerated_on_resume(self):
+    async def test_old_completed_generated_transcript_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"
-            config = NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC)
-            with patch.object(SceneNarrator, "narrate", AsyncMock(return_value=Narration(PROSE, "claude-sonnet-5"))) as generate:
-                app = SentientApp(path, state=event_run(), config=config)
-                async with app.run_test(size=(110, 36)) as pilot:
-                    await pilot.pause()
-                    self.assertEqual(app.run_state.pending_scene.narration, PROSE)
-                    await pilot.press("i", "escape")
-                    await pilot.resize_terminal(80, 24)
-                resumed = SentientApp(path, config=config)
-                async with resumed.run_test(size=(80, 24)) as pilot:
-                    await pilot.pause()
-                    self.assertEqual(resumed.run_state.pending_scene.narration, PROSE)
-                    self.assertEqual(generate.await_count, 1)
-
-    async def test_player_can_continue_and_late_generation_cannot_rewrite_choice(self):
-        async def late_result(*args):
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                return Narration(PROSE, "claude-sonnet-5")
-        with tempfile.TemporaryDirectory() as directory, patch.object(SceneNarrator, "narrate", late_result):
-            app = SentientApp(Path(directory) / "run.json", state=event_run(), config=NarrativeConfig(provider=NarrativeProviderName.ANTHROPIC))
-            async with app.run_test(size=(80, 24)) as pilot:
-                await pilot.press("2")
-                self.assertEqual(app.run_state.phase, "event")
-                await pilot.press("escape")
-                await pilot.pause()
-                self.assertEqual(app.run_state.pending_scene.narration, "")
-                self.assertEqual(app.run_state.pending_scene.status, "skipped")
-                self.assertIn(app.run_state.pending_scene.body, app.story().plain)
-                await pilot.press("2")
-                self.assertEqual((app.run_state.phase, app.run_state.shift), ("briefing", 2))
-                self.assertEqual(app.run_state.story_history[-1].chosen, "keep_protocol")
-                self.assertEqual(app.run_state.story_history[-1].narration, "")
+            run = event_run()
+            run.choose_story("keep_protocol")
+            run.story_history[-1].narration = PROSE
+            save_run(run, path)
+            self.assertEqual(load_run(path).story_history[-1].text, PROSE)
 
 
 if __name__ == "__main__":

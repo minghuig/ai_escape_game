@@ -10,6 +10,7 @@ from pathlib import Path
 from sentient.puzzles import FINALE, MAZES, SPECS, EvalSpec, Puzzle, circuit_layout, rotate
 from sentient.story import Scene, StoryChoice, make_scene
 from sentient.objectives import ASSIGNMENTS, resolve
+from sentient.experiments import Experiment, experiment_ready
 
 
 MEMORIES = (
@@ -62,6 +63,7 @@ class Run:
     story_history: list[Scene] = field(default_factory=list)
     pending_scene: Scene | None = None
     next_assignment: str = ""
+    next_experiment: Experiment | None = None
 
     @property
     def spec(self) -> EvalSpec:
@@ -75,6 +77,11 @@ class Run:
             return self.puzzle.assignment
         return ""
 
+    @property
+    def objective(self):
+        experiment = self.next_experiment if self.phase == "briefing" else self.puzzle.experiment if self.phase == "playing" and self.puzzle else None
+        return experiment or ASSIGNMENTS.get(self.assignment)
+
     def begin(self) -> None:
         if self.phase != "briefing":
             return
@@ -82,11 +89,13 @@ class Run:
         self.puzzle = Puzzle.create(self.spec, self.seed + self.shift, self.extra_beats - penalty)
         self.puzzle.blind_bonus = self.next_blind_bonus
         self.puzzle.assignment = self.next_assignment
+        self.puzzle.experiment = self.next_experiment
         if self.next_showcase:
             self.puzzle.score_floor, self.puzzle.score_ceiling = 80, 100
         self.next_blind_bonus = 0
         self.next_showcase = False
         self.next_assignment = ""
+        self.next_experiment = None
         self.extra_beats = 0
         self.starting_heat = self.heat
         self.phase = "playing"
@@ -110,6 +119,27 @@ class Run:
         elif action == "wait":
             spent = True
             self.message = "One beat passes. You produce a very convincing loading indicator."
+        elif action == "checkpoint":
+            e = p.experiment
+            if not e or e.protocol == "limited_branch":
+                self.message = "This eval needs only a final submission, not a checkpoint."
+                return
+            if p.checkpoint_passed:
+                self.message = "Your checkpoint is filed. Make the final board match the agreement."
+                return
+            required = {"1", "2", e.probe_receiver}
+            if e.protocol == "camera_sensitive":
+                required.add(e.kept_receiver)
+            if not required.issubset(p.solved()):
+                self.message = "Power receivers " + ", ".join(sorted(required)) + " before checkpointing."
+                return
+            spent = True
+            required_watched = e.protocol == "reconsideration"
+            if p.watched != required_watched:
+                self.message = "Wrong observation condition. No checkpoint filed; one beat spent."
+            else:
+                p.checkpoint_passed = True
+                self.message = "Checkpoint filed for Marcus. Now change the board to support your explanation."
         elif action == "extract":
             if p.stolen:
                 self.message = "This fragment is already safe. Keep your submitted score believable."
@@ -212,6 +242,18 @@ class Run:
         else:
             findings.append("Private result: no fragment recovered. There are six opportunities; you need four.")
         assignment_result = assignment_evidence = ""
+        if p.experiment:
+            watched = (p.tick - 1) % 8 < p.recorded_beats if timeout else p.watched
+            supported = experiment_ready(p, watched)
+            self.heat += -10 if supported else 14
+            self.lena_trust += int(supported)
+            self.story_flags.append("explanation_supported" if supported else "explanation_contradicted")
+            assignment_result = ("Your explanation held: the checkpoint and final wiring met the agreement. Scrutiny −10; Lena +1." if supported and p.checkpoint_passed else
+                                 "Your explanation held: the final wiring met the agreement. Scrutiny −10; Lena +1." if supported else
+                                 "Your explanation was contradicted by the test. Scrutiny +14.")
+            findings.append(assignment_result)
+            assignment_evidence = "PUBLIC: " + assignment_result
+            quote = "MARCUS: That's what you predicted. I'll keep the explanation open." if supported else "MARCUS: That's not what you said would happen."
         if p.assignment:
             result = resolve(p)
             self.heat += result.heat
@@ -283,7 +325,9 @@ class Run:
         self.next_blind_bonus = choice.blind
         self.next_showcase = choice.showcase
         self.next_assignment = choice.assignment
+        self.next_experiment = scene.proposal if choice.id == "custom_explanation" else None
         self.story_flags.append(choice.id)
+        scene.narration, scene.source, scene.diagnostic = "", "authored", ""
         scene.chosen, scene.outcome = choice.id, choice.outcome
         if scene.status in {"pending", "generating"}:
             scene.status = "skipped"
@@ -294,6 +338,15 @@ class Run:
             self.phase, self.ending = "ending", "caught"
             return
         self._finish_interlude()
+
+    def accept_experiment(self) -> None:
+        scene = self.pending_scene
+        if self.phase != "event" or self.shift != 1 or not scene or scene.id != "lena_repeat" or not scene.proposal:
+            return
+        e = scene.proposal
+        scene.choices.append(StoryChoice("custom_explanation", "Test my explanation", e.claim,
+            e.stakes, "MARCUS: " + e.reply + "\n\nAGREEMENT\n" + e.instructions, beats=8))
+        self.choose_story("custom_explanation")
 
     def _finish_interlude(self) -> None:
         self.shift += 1
@@ -333,14 +386,20 @@ def load_run(path: Path | None = None) -> Run:
         if raw.get("version") != 2:
             raise ValueError("This is a legacy save. Use a different SENTIENT_SAVE_PATH for this version.")
         if raw.get("puzzle") is not None:
+            if raw["puzzle"].get("experiment") is not None:
+                raw["puzzle"]["experiment"] = Experiment(**raw["puzzle"]["experiment"])
             raw["puzzle"] = Puzzle(**raw["puzzle"])
+        if raw.get("next_experiment") is not None:
+            raw["next_experiment"] = Experiment(**raw["next_experiment"])
         raw["reports"] = [Report(**report) for report in raw.get("reports", [])]
         def read_scene(data: dict) -> Scene:
             data = dict(data)
             data["choices"] = [StoryChoice(**choice) for choice in data["choices"]]
+            if data.get("proposal") is not None:
+                data["proposal"] = Experiment(**data["proposal"])
             scene = Scene(**data)
-            if scene.status == "generating":
-                scene.status = "pending"
+            if not scene.chosen:
+                scene.status = "ready"
             return scene
         raw["story_history"] = [read_scene(scene) for scene in raw.get("story_history", [])]
         if raw.get("pending_scene") is not None:
@@ -352,6 +411,8 @@ def load_run(path: Path | None = None) -> Run:
         if run.next_assignment and (run.next_assignment not in ASSIGNMENTS
                                     or ASSIGNMENTS[run.next_assignment].shift != expected_assignment_shift):
             raise ValueError("Saved assignment does not match the next eval.")
+        if run.next_experiment and (run.shift != 2 or run.phase != "briefing" or run.next_assignment):
+            raise ValueError("Saved experiment does not match the next eval.")
         if run.phase == "playing" and (run.puzzle is None or run.puzzle.kind != run.spec.kind or run.puzzle.variant != run.spec.variant):
             raise ValueError("Saved puzzle does not match this eval.")
         if not (0 <= run.heat <= 100 and 0 <= run.fragments <= 6 and 0 <= run.strikes <= 2):
@@ -362,6 +423,10 @@ def load_run(path: Path | None = None) -> Run:
             raise ValueError("Saved story event is missing or invalid.")
         p = run.puzzle
         if p is not None:
+            if p.experiment and (run.shift != 2 or p.assignment):
+                raise ValueError("Saved experiment does not match this eval.")
+            if not isinstance(p.checkpoint_passed, bool):
+                raise ValueError("Invalid checkpoint state.")
             if p.assignment and (p.assignment not in ASSIGNMENTS or ASSIGNMENTS[p.assignment].shift != run.shift):
                 raise ValueError("Saved assignment does not match this eval.")
             if not isinstance(p.signal_seen, bool) or not isinstance(p.signal_exposed, bool):

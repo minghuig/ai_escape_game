@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from random import Random
+from sentient.experiments import Experiment
 
 
 @dataclass(frozen=True)
@@ -181,6 +182,8 @@ class Puzzle:
     assignment: str = ""
     signal_seen: bool = False
     signal_exposed: bool = False
+    experiment: Experiment | None = None
+    checkpoint_passed: bool = False
 
     @classmethod
     def create(cls, spec: EvalSpec, seed: int = 0, extra: int = 0) -> Puzzle:
